@@ -5,6 +5,8 @@ use std::{
     fs::{File, OpenOptions},
     io::{Error, ErrorKind, Read, Result, Seek, SeekFrom},
     slice,
+    thread::sleep,
+    time::Duration,
 };
 
 // Memory offsets for gpio, see the spec for more details
@@ -210,6 +212,72 @@ impl Gpio {
         PinState::Low
     }
 
+    // NOTE without root permission this changes will simply do nothing successfully
+    //
+    // SetFreq: Set clock speed for given pin in Clock or Pwm mode
+    //
+    // Param freq should be in range 4688Hz - 19.2MHz to prevent unexpected behavior,
+    // however output frequency of Pwm pins can be further adjusted with SetDutyCycle.
+    // So for smaller frequencies use Pwm pin with large cycle range. (Or implement custom software clock using output pin and sleep.)
+    //
+    // Note that some pins share the same clock source, it means that
+    // changing frequency for one pin will change it also for all pins within a group.
+    // The groups are:
+    //   gp_clk0: pins 4, 20, 32, 34
+    //   gp_clk1: pins 5, 21, 42, 44
+    //   gp_clk2: pins 6 and 43
+    //   pwm_clk: pins 12, 13, 18, 19, 40, 41, 45
+    pub fn set_freq(&mut self, pin: Pin, freq: u32) {
+        // TODO: would be nice to choose best clock source depending on target frequency, oscilator is used for now
+        let source_freq = 19200000u32; // oscilator frequency
+        let div_mask = 4095u32; // divi and divf have 12 bits each
+
+        let divi = (source_freq / freq) & div_mask;
+        let divf = (((source_freq % freq) << 12) / freq) & div_mask;
+
+        let (clk_ctl_reg, clk_div_reg) = {
+            let ctl = 28usize;
+            let div = 28usize;
+            match pin {
+                4 | 20 | 32 | 34 => (ctl + 0, div + 1), // clk0
+                5 | 21 | 42 | 44 => (ctl + 2, div + 3), // clk1
+                6 | 43 => (ctl + 4, div + 5),           // clk2
+                // pwm_clk - shared clk for both pwm channels
+                12 | 13 | 40 | 41 | 45 | 18 | 19 => {
+                    stop_pwm(self); // pwm clk busy wont go down without stopping pwm first
+                    (ctl + 12, div + 13)
+                }
+                _ => return,
+            }
+        };
+
+        let mash = if divi < 2 || divf == 0 { 0 } else { 1u32 << 9 };
+
+        let password = 0x5A000000u32;
+        let busy = 1u32 << 7;
+        let enab = 1u32 << 4;
+        let src = 1u32 << 0; // oscilator
+
+        let clk_mem = self.clk.as_u32_mut_slice();
+        clk_mem[clk_ctl_reg] = password | (clk_mem[clk_ctl_reg] & !enab); // stop gpio clock (without changing src or mash)
+
+        while clk_mem[clk_ctl_reg] & busy != 0 {
+            // ... and wait for not busy
+            sleep(Duration::from_micros(10));
+        }
+
+        clk_mem[clk_ctl_reg] = password | mash | src; // set mash and source (without enabling clock)
+        clk_mem[clk_div_reg] = password | (divi << 12) | divf; // set dividers
+
+        // mash and src can not be changed in same step as enab, to prevent lock-up and glitches
+        sleep(Duration::from_micros(10)); // ... so wait for them to take effect
+
+        clk_mem[clk_ctl_reg] = password | mash | src | enab; // finally start clock
+
+        // defer code
+        start_pwm(self);
+    }
+
     // The Pi 4 uses a BCM 2711, which has different register offsets and base addresses than the rest of the Pi family (so far).  This
     // helper function checks if we're on a 2711 and hence a Pi 4
     fn is_bcm2711(&self) -> bool {
@@ -266,6 +334,20 @@ fn read_base_addr(offset: usize) -> Result<usize> {
             "Cannot read as bigendian uint32",
         )),
     }
+}
+
+// Starts pwm for both channels
+fn start_pwm(gpio: &mut Gpio) {
+    let pwm_ctl_reg = 0;
+    let pwen = 1;
+    gpio.pwm.as_u32_mut_slice()[pwm_ctl_reg] &= !(pwen << 8 | pwen);
+}
+
+// Stop pwm for both channels
+fn stop_pwm(gpio: &mut Gpio) {
+    let pwm_ctl_reg = 0;
+    let pwen = 1;
+    gpio.pwm.as_u32_mut_slice()[pwm_ctl_reg] |= pwen << 8 | pwen;
 }
 
 #[inline]
