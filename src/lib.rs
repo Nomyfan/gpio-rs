@@ -302,6 +302,52 @@ impl Gpio {
         disable_irqs(self.intr.as_u32_mut_slice(), irqs);
     }
 
+    // NOTE without root permission this changes will simply do nothing successfully
+    // SetDutyCycle: Set cycle length (range) and duty length (data) for Pwm pin in M/S mode
+    //
+    //   |<- duty ->|
+    //    __________
+    //  _/          \_____________/
+    //   |<------- cycle -------->|
+    //
+    // Output frequency is computed as pwm clock frequency divided by cycle length.
+    // So, to set Pwm pin to freqency 38kHz with duty cycle 1/4, use this combination:
+    //
+    //  pin.Pwm()
+    //  pin.DutyCycle(1, 4)
+    //  pin.Freq(38000*4)
+    //
+    // Note that some pins share common pwm channel,
+    // so calling this function will set same duty cycle for all pins belonging to channel.
+    // The channels are:
+    //   channel 1 (pwm0) for pins 12, 18, 40
+    //   channel 2 (pwm1) for pins 13, 19, 41, 45.
+    pub fn set_duty_cycle(&mut self, pin: &Pin, duty_len: u32, cycle_len: u32) {
+        let pwm_ctl_reg = 0usize;
+
+        // shift: offset inside ctlReg
+        let (pwm_dat_reg, pwm_rng_reg, shift) = match pin {
+            12 | 18 | 40 => (4usize, 5usize, 0u8),      // channel pwm0
+            13 | 19 | 41 | 45 => (8usize, 9usize, 8u8), // channel pwm1
+            _ => return,
+        };
+
+        let ctl_mask = 255u32; // ctl setting has 8 bits for each channel
+        let pwen = 1 << 0; // enable pwm
+        let msen = 1 << 7; // use M/S transition instead of pwm algorithm
+
+        let pwm = self.pwm.as_u32_mut_slice();
+        // reset settings
+        pwm[pwm_ctl_reg] =
+            (pwm[pwm_ctl_reg] & !(ctl_mask << shift)) | (msen << shift) | (pwen << shift);
+
+        // set duty cycle
+        pwm[pwm_dat_reg] = duty_len;
+        pwm[pwm_rng_reg] = cycle_len;
+
+        sleep(Duration::from_micros(10));
+    }
+
     // The Pi 4 uses a BCM 2711, which has different register offsets and base addresses than the rest of the Pi family (so far).  This
     // helper function checks if we're on a 2711 and hence a Pi 4
     fn is_bcm2711(&self) -> bool {
