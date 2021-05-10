@@ -67,6 +67,10 @@ enum Edge {
     AnyEdge = 0b00000011, // RiseEdge | FallEdge
 }
 
+// IRQs(High, Low) High -> high 32 bits of u64, Low -> low 32 bits of u64
+#[derive(Copy, Clone)]
+pub struct IRQs(u32, u32);
+
 struct Gpio {
     gpio: MmapMut,
     clk: MmapMut,
@@ -74,7 +78,7 @@ struct Gpio {
     spi: MmapMut,
     intr: MmapMut,
 
-    irps_backup: usize,
+    irqs_backup: IRQs,
 }
 
 trait U32Slice {
@@ -94,6 +98,12 @@ impl U32Slice for MmapMut {
     }
 }
 
+impl Drop for Gpio {
+    fn drop(&mut self) {
+        enable_irqs(self.intr.as_u32_mut_slice(), &self.irqs_backup);
+    }
+}
+
 impl Gpio {
     pub fn new() -> Result<Gpio> {
         let base_addr = get_base_addr();
@@ -105,14 +115,20 @@ impl Gpio {
 
         let file = open_mem_file()?;
 
+        let gpio = map_mem(&file, gpio_addr, PAGE_SIZE)?;
+        let clk = map_mem(&file, clk_addr, PAGE_SIZE)?;
+        let pwm = map_mem(&file, pwm_addr, PAGE_SIZE)?;
+        let spi = map_mem(&file, spi_addr, PAGE_SIZE)?;
+        let mut intr = map_mem(&file, intr_addr, PAGE_SIZE)?;
+        let irqs_backup = read_irqs(intr.as_u32_mut_slice()); // back up enabled IRQs, to restore it later
+
         Ok(Gpio {
-            gpio: map_mem(&file, gpio_addr, PAGE_SIZE)?,
-            clk: map_mem(&file, clk_addr, PAGE_SIZE)?,
-            pwm: map_mem(&file, pwm_addr, PAGE_SIZE)?,
-            spi: map_mem(&file, spi_addr, PAGE_SIZE)?,
-            intr: map_mem(&file, intr_addr, PAGE_SIZE)?,
-            // TODO
-            irps_backup: 0x0,
+            gpio,
+            clk,
+            pwm,
+            spi,
+            intr,
+            irqs_backup,
         })
     }
 
@@ -278,6 +294,14 @@ impl Gpio {
         start_pwm(self);
     }
 
+    pub fn enable_irqs(&mut self, irqs: &IRQs) {
+        enable_irqs(self.intr.as_u32_mut_slice(), irqs);
+    }
+
+    pub fn disable_irqs(&mut self, irqs: &IRQs) {
+        disable_irqs(self.intr.as_u32_mut_slice(), irqs);
+    }
+
     // The Pi 4 uses a BCM 2711, which has different register offsets and base addresses than the rest of the Pi family (so far).  This
     // helper function checks if we're on a 2711 and hence a Pi 4
     fn is_bcm2711(&self) -> bool {
@@ -348,6 +372,35 @@ fn stop_pwm(gpio: &mut Gpio) {
     let pwm_ctl_reg = 0;
     let pwen = 1;
     gpio.pwm.as_u32_mut_slice()[pwm_ctl_reg] |= pwen << 8 | pwen;
+}
+
+// Enables given IRQs (by setting bit to 1 at intended position).
+// See 'ARM peripherals interrupts table' in pheripherals datasheet.
+// WARNING: you can corrupt your system, only use this if you know what you are doing.
+fn enable_irqs(intr: &mut [u32], irqs: &IRQs) {
+    let irq_enable_0 = 0x214usize / 4;
+    let irq_enable_1 = 0x210usize / 4;
+
+    intr[irq_enable_0] = irqs.0; // IRQ 32..63
+    intr[irq_enable_1] = irqs.1; // IRQ 0..31
+}
+
+// Disables given IRQs (by setting bit to 1 at intended position).
+// See 'ARM peripherals interrupts table' in pheripherals datasheet.
+// WARNING: you can corrupt your system, only use this if you know what you are doing.
+fn disable_irqs(intr: &mut [u32], irqs: &IRQs) {
+    let irq_disable_0 = 0x220usize / 4;
+    let irq_disable_1 = 0x21Cusize / 4;
+
+    intr[irq_disable_0] = irqs.0; // IRQ 32..63
+    intr[irq_disable_1] = irqs.1; // IRQ 0..31
+}
+
+fn read_irqs(intr: &mut [u32]) -> IRQs {
+    let irq_enable_0 = 0x214usize / 4;
+    let irq_enable_1 = 0x210usize / 4;
+
+    IRQs(intr[irq_enable_0], intr[irq_enable_1])
 }
 
 #[inline]
