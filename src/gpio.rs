@@ -135,226 +135,46 @@ impl Gpio {
         })
     }
 
-    // Sets the mode of a given pin (Input, Output, Clock, Pwm or Spi)
-    //
-    // Clock is possible only for pins 4, 5, 6, 20, 21.
-    // Pwm is possible only for pins 12, 13, 18, 19.
-    //
-    // Spi mode should not be set by this directly, use SpiBegin instead.
     pub fn set_pin_mode(&mut self, pin: Pin, mode: PinMode) {
-        let fsel_reg = pin as usize / 10;
-        let shift = pin % 10 * 3;
-
-        let _in = 0b0;
-        let _out = 0b1;
-        let _alt0 = 0b100;
-        let _alt1 = 0b101;
-        let _alt2 = 0b110;
-        let _alt3 = 0b111;
-        let _alt4 = 0b011;
-        let _alt5 = 0b010;
-
-        let f = match mode {
-            PinMode::Input => _in,
-            PinMode::Ouput => _out,
-            PinMode::Clock => match pin {
-                4 | 5 | 6 | 32 | 34 | 42 | 43 | 44 => _alt0,
-                20 | 21 => _alt5,
-                _ => return,
-            },
-            PinMode::Pwm => match pin {
-                12 | 13 | 40 | 41 | 45 => _alt0,
-                18 | 19 => _alt5,
-                _ => return,
-            },
-            PinMode::Spi => match pin {
-                7 | 8 | 9 | 10 | 11 => _alt0,    // SPI0,
-                35 | 36 | 37 | 38 | 39 => _alt0, // SPI0
-                16 | 17 | 18 | 19 | 20 | 21 => _alt4,
-                40 | 41 | 42 | 43 | 44 | 45 => _alt4,
-                _ => return,
-            },
-            PinMode::Alt0 => _alt0,
-            PinMode::Alt1 => _alt1,
-            PinMode::Alt2 => _alt2,
-            PinMode::Alt3 => _alt3,
-            PinMode::Alt4 => _alt4,
-            PinMode::Alt5 => _alt5,
-        };
-
-        let pin_mask = 7; // 111 - pinmode is 3 bits
-
-        let mem = self.gpio.as_u32_mut_slice();
-        mem[fsel_reg] = (mem[fsel_reg] & !(pin_mask << shift)) | (f << shift);
+        set_pin_mode(self.gpio.as_u32_mut_slice(), pin, mode)
     }
 
     pub fn write_pin(&mut self, pin: Pin, state: PinState) {
-        // Set register, 7 / 8 depending on bank
-        // Clear register, 10 / 11 depending on bank
-        let set_reg = pin as usize / 32 + 7;
-        let clear_reg = pin as usize / 32 + 10;
-
-        match state {
-            PinState::Low => {
-                self.gpio.as_u32_mut_slice()[clear_reg] = 1 << (pin & 31);
-            }
-            PinState::High => {
-                self.gpio.as_u32_mut_slice()[set_reg] = 1 << (pin & 31);
-            }
-        }
+        write_pin(self.gpio.as_u32_mut_slice(), pin, state)
     }
 
     pub fn toggle_pin(&mut self, pin: Pin) {
-        let pin_usize = pin as usize;
-
-        let set_reg = pin_usize / 32 + 7;
-        let clear_reg = pin_usize / 32 + 10;
-        let level_reg = pin_usize / 32 + 13;
-
-        let bit: u32 = 1 << (pin & 31);
-
-        let mem = self.gpio.as_u32_mut_slice();
-        if (mem[level_reg] & bit) != 0 {
-            mem[clear_reg] = bit;
-        } else {
-            mem[set_reg] = bit;
-        }
+        toggle_pin(self.gpio.as_u32_mut_slice(), pin)
     }
 
     pub fn read_pin(&self, pin: Pin) -> PinState {
-        let level_reg = pin as usize / 32 + 13;
-
-        if (self.gpio.as_u32_slice()[level_reg] & (1 << (pin & 31))) != 0 {
-            return PinState::High;
-        }
-
-        PinState::Low
+        read_pin(self.gpio.as_u32_slice(), pin)
     }
 
-    // NOTE without root permission this changes will simply do nothing successfully
-    //
-    // SetFreq: Set clock speed for given pin in Clock or Pwm mode
-    //
-    // Param freq should be in range 4688Hz - 19.2MHz to prevent unexpected behavior,
-    // however output frequency of Pwm pins can be further adjusted with SetDutyCycle.
-    // So for smaller frequencies use Pwm pin with large cycle range. (Or implement custom software clock using output pin and sleep.)
-    //
-    // Note that some pins share the same clock source, it means that
-    // changing frequency for one pin will change it also for all pins within a group.
-    // The groups are:
-    //   gp_clk0: pins 4, 20, 32, 34
-    //   gp_clk1: pins 5, 21, 42, 44
-    //   gp_clk2: pins 6 and 43
-    //   pwm_clk: pins 12, 13, 18, 19, 40, 41, 45
     pub fn set_freq(&mut self, pin: Pin, freq: u32) {
-        // TODO: would be nice to choose best clock source depending on target frequency, oscilator is used for now
-        let source_freq = 19200000u32; // oscilator frequency
-        let div_mask = 4095u32; // divi and divf have 12 bits each
-
-        let divi = (source_freq / freq) & div_mask;
-        let divf = (((source_freq % freq) << 12) / freq) & div_mask;
-
-        let (clk_ctl_reg, clk_div_reg) = {
-            let ctl = 28usize;
-            let div = 28usize;
-            match pin {
-                4 | 20 | 32 | 34 => (ctl + 0, div + 1), // clk0
-                5 | 21 | 42 | 44 => (ctl + 2, div + 3), // clk1
-                6 | 43 => (ctl + 4, div + 5),           // clk2
-                // pwm_clk - shared clk for both pwm channels
-                12 | 13 | 40 | 41 | 45 | 18 | 19 => {
-                    stop_pwm(self); // pwm clk busy wont go down without stopping pwm first
-                    (ctl + 12, div + 13)
-                }
-                _ => return,
-            }
-        };
-
-        let mash = if divi < 2 || divf == 0 { 0 } else { 1u32 << 9 };
-
-        let password = 0x5A000000u32;
-        let busy = 1u32 << 7;
-        let enab = 1u32 << 4;
-        let src = 1u32 << 0; // oscilator
-
         let clk_mem = self.clk.as_u32_mut_slice();
-        clk_mem[clk_ctl_reg] = password | (clk_mem[clk_ctl_reg] & !enab); // stop gpio clock (without changing src or mash)
+        let pwm_mem = self.pwm.as_u32_mut_slice();
 
-        while clk_mem[clk_ctl_reg] & busy != 0 {
-            // ... and wait for not busy
-            sleep(Duration::from_micros(10));
-        }
-
-        clk_mem[clk_ctl_reg] = password | mash | src; // set mash and source (without enabling clock)
-        clk_mem[clk_div_reg] = password | (divi << 12) | divf; // set dividers
-
-        // mash and src can not be changed in same step as enab, to prevent lock-up and glitches
-        sleep(Duration::from_micros(10)); // ... so wait for them to take effect
-
-        clk_mem[clk_ctl_reg] = password | mash | src | enab; // finally start clock
-
-        // defer code
-        start_pwm(self);
+        set_freq(clk_mem, pwm_mem, pin, freq)
     }
 
     pub fn enable_irqs(&mut self, irqs: &IRQs) {
-        enable_irqs(self.intr.as_u32_mut_slice(), irqs);
+        enable_irqs(self.intr.as_u32_mut_slice(), irqs)
     }
 
     pub fn disable_irqs(&mut self, irqs: &IRQs) {
-        disable_irqs(self.intr.as_u32_mut_slice(), irqs);
+        disable_irqs(self.intr.as_u32_mut_slice(), irqs)
     }
 
-    // NOTE without root permission this changes will simply do nothing successfully
-    // SetDutyCycle: Set cycle length (range) and duty length (data) for Pwm pin in M/S mode
-    //
-    //   |<- duty ->|
-    //    __________
-    //  _/          \_____________/
-    //   |<------- cycle -------->|
-    //
-    // Output frequency is computed as pwm clock frequency divided by cycle length.
-    // So, to set Pwm pin to freqency 38kHz with duty cycle 1/4, use this combination:
-    //
-    //  pin.Pwm()
-    //  pin.DutyCycle(1, 4)
-    //  pin.Freq(38000*4)
-    //
-    // Note that some pins share common pwm channel,
-    // so calling this function will set same duty cycle for all pins belonging to channel.
-    // The channels are:
-    //   channel 1 (pwm0) for pins 12, 18, 40
-    //   channel 2 (pwm1) for pins 13, 19, 41, 45.
     pub fn set_duty_cycle(&mut self, pin: Pin, duty_len: u32, cycle_len: u32) {
-        let pwm_ctl_reg = 0usize;
-
-        // shift: offset inside ctlReg
-        let (pwm_dat_reg, pwm_rng_reg, shift) = match pin {
-            12 | 18 | 40 => (4usize, 5usize, 0u8),      // channel pwm0
-            13 | 19 | 41 | 45 => (8usize, 9usize, 8u8), // channel pwm1
-            _ => return,
-        };
-
-        let ctl_mask = 255u32; // ctl setting has 8 bits for each channel
-        let pwen = 1 << 0; // enable pwm
-        let msen = 1 << 7; // use M/S transition instead of pwm algorithm
-
-        let pwm = self.pwm.as_u32_mut_slice();
-        // reset settings
-        pwm[pwm_ctl_reg] =
-            (pwm[pwm_ctl_reg] & !(ctl_mask << shift)) | (msen << shift) | (pwen << shift);
-
-        // set duty cycle
-        pwm[pwm_dat_reg] = duty_len;
-        pwm[pwm_rng_reg] = cycle_len;
-
-        sleep(Duration::from_micros(10));
+        set_duty_cycle(self.pwm.as_u32_mut_slice(), pin, duty_len, cycle_len)
     }
 
     pub fn set_pull_mode(&mut self, pin: Pin, pull: Pull) {
         let is_bcm2711 = self.is_bcm2711();
         let gpio_mem = self.gpio.as_u32_mut_slice();
-        set_pull_mode(gpio_mem, pin, pull, is_bcm2711);
+
+        set_pull_mode(gpio_mem, pin, pull, is_bcm2711)
     }
 
     pub fn read_pull(&self, pin: Pin) -> Option<Pull> {
@@ -364,11 +184,13 @@ impl Gpio {
     pub fn detect_edge(&mut self, pin: Pin, edge: Edge) {
         let gpio_mem = self.gpio.as_u32_mut_slice();
         let intr_mem = self.intr.as_u32_mut_slice();
-        detect_edge(gpio_mem, intr_mem, pin, edge);
+
+        detect_edge(gpio_mem, intr_mem, pin, edge)
     }
 
     pub fn is_edge_detected(&mut self, pin: Pin) -> bool {
         let gpio_mem = self.gpio.as_u32_mut_slice();
+
         is_edge_detected(gpio_mem, pin)
     }
 
@@ -399,33 +221,6 @@ fn map_mem(file: &File, offset: usize, len: usize) -> Result<MmapMut> {
     let mmap = unsafe { options.map_mut(file)? };
 
     Ok(mmap)
-}
-
-// Read /proc/device-tree/soc/ranges and determine the base address.
-// Use the default Raspberry Pi 1 base address if this fails.
-fn read_base_addr(offset: usize) -> Result<usize> {
-    let mut ranges = File::open("/proc/device-tree/soc/ranges")?;
-
-    ranges.seek(SeekFrom::Start(offset as u64))?;
-    let mut buf = vec![0u8; 4];
-    let read = ranges.read(&mut buf[..])?;
-    if read != buf.len() {
-        return Err(Error::new(ErrorKind::UnexpectedEof, "EOF"));
-    }
-
-    match read_bigendian_u32(&buf) {
-        Some(out) => match out {
-            0 => Err(Error::new(
-                ErrorKind::InvalidData,
-                "Invalid bigendian uint32",
-            )),
-            x => Ok(x as usize),
-        },
-        None => Err(Error::new(
-            ErrorKind::InvalidData,
-            "Cannot read as bigendian uint32",
-        )),
-    }
 }
 
 fn set_pull_mode(gpio_mem: &mut [u32], pin: Pin, pull: Pull, is_bcm2711: bool) {
@@ -552,47 +347,251 @@ fn is_edge_detected(gpio_mem: &mut [u32], pin: Pin) -> bool {
     test != 0
 }
 
+// NOTE without root permission this changes will simply do nothing successfully
+//
+// SetFreq: Set clock speed for given pin in Clock or Pwm mode
+//
+// Param freq should be in range 4688Hz - 19.2MHz to prevent unexpected behavior,
+// however output frequency of Pwm pins can be further adjusted with SetDutyCycle.
+// So for smaller frequencies use Pwm pin with large cycle range. (Or implement custom software clock using output pin and sleep.)
+//
+// Note that some pins share the same clock source, it means that
+// changing frequency for one pin will change it also for all pins within a group.
+// The groups are:
+//   gp_clk0: pins 4, 20, 32, 34
+//   gp_clk1: pins 5, 21, 42, 44
+//   gp_clk2: pins 6 and 43
+//   pwm_clk: pins 12, 13, 18, 19, 40, 41, 45
+fn set_freq(clk_mem: &mut [u32], pwm_mem: &mut [u32], pin: Pin, freq: u32) {
+    // TODO: would be nice to choose best clock source depending on target frequency, oscilator is used for now
+    let source_freq = 19200000u32; // oscilator frequency
+    let div_mask = 4095u32; // divi and divf have 12 bits each
+
+    let divi = (source_freq / freq) & div_mask;
+    let divf = (((source_freq % freq) << 12) / freq) & div_mask;
+
+    let (clk_ctl_reg, clk_div_reg) = {
+        let ctl = 28usize;
+        let div = 28usize;
+        match pin {
+            4 | 20 | 32 | 34 => (ctl + 0, div + 1), // clk0
+            5 | 21 | 42 | 44 => (ctl + 2, div + 3), // clk1
+            6 | 43 => (ctl + 4, div + 5),           // clk2
+            // pwm_clk - shared clk for both pwm channels
+            12 | 13 | 40 | 41 | 45 | 18 | 19 => {
+                stop_pwm(pwm_mem); // pwm clk busy wont go down without stopping pwm first
+                (ctl + 12, div + 13)
+            }
+            _ => return,
+        }
+    };
+
+    let mash = if divi < 2 || divf == 0 { 0 } else { 1u32 << 9 };
+
+    let password = 0x5A000000u32;
+    let busy = 1u32 << 7;
+    let enab = 1u32 << 4;
+    let src = 1u32 << 0; // oscilator
+
+    clk_mem[clk_ctl_reg] = password | (clk_mem[clk_ctl_reg] & !enab); // stop gpio clock (without changing src or mash)
+
+    while clk_mem[clk_ctl_reg] & busy != 0 {
+        // ... and wait for not busy
+        sleep(Duration::from_micros(10));
+    }
+
+    clk_mem[clk_ctl_reg] = password | mash | src; // set mash and source (without enabling clock)
+    clk_mem[clk_div_reg] = password | (divi << 12) | divf; // set dividers
+
+    // mash and src can not be changed in same step as enab, to prevent lock-up and glitches
+    sleep(Duration::from_micros(10)); // ... so wait for them to take effect
+
+    clk_mem[clk_ctl_reg] = password | mash | src | enab; // finally start clock
+
+    // defer code
+    start_pwm(pwm_mem);
+}
+
 // Starts pwm for both channels
-fn start_pwm(gpio: &mut Gpio) {
+fn start_pwm(pwm_mem: &mut [u32]) {
     let pwm_ctl_reg = 0;
     let pwen = 1;
-    gpio.pwm.as_u32_mut_slice()[pwm_ctl_reg] &= !(pwen << 8 | pwen);
+    pwm_mem[pwm_ctl_reg] &= !(pwen << 8 | pwen);
 }
 
 // Stop pwm for both channels
-fn stop_pwm(gpio: &mut Gpio) {
+fn stop_pwm(pwm_mem: &mut [u32]) {
     let pwm_ctl_reg = 0;
     let pwen = 1;
-    gpio.pwm.as_u32_mut_slice()[pwm_ctl_reg] |= pwen << 8 | pwen;
+    pwm_mem[pwm_ctl_reg] |= pwen << 8 | pwen;
+}
+
+// NOTE without root permission this changes will simply do nothing successfully
+// SetDutyCycle: Set cycle length (range) and duty length (data) for Pwm pin in M/S mode
+//
+//   |<- duty ->|
+//    __________
+//  _/          \_____________/
+//   |<------- cycle -------->|
+//
+// Output frequency is computed as pwm clock frequency divided by cycle length.
+// So, to set Pwm pin to freqency 38kHz with duty cycle 1/4, use this combination:
+//
+//  pin.Pwm()
+//  pin.DutyCycle(1, 4)
+//  pin.Freq(38000*4)
+//
+// Note that some pins share common pwm channel,
+// so calling this function will set same duty cycle for all pins belonging to channel.
+// The channels are:
+//   channel 1 (pwm0) for pins 12, 18, 40
+//   channel 2 (pwm1) for pins 13, 19, 41, 45.
+fn set_duty_cycle(pwm_mem: &mut [u32], pin: Pin, duty_len: u32, cycle_len: u32) {
+    let pwm_ctl_reg = 0usize;
+
+    // shift: offset inside ctlReg
+    let (pwm_dat_reg, pwm_rng_reg, shift) = match pin {
+        12 | 18 | 40 => (4usize, 5usize, 0u8),      // channel pwm0
+        13 | 19 | 41 | 45 => (8usize, 9usize, 8u8), // channel pwm1
+        _ => return,
+    };
+
+    let ctl_mask = 255u32; // ctl setting has 8 bits for each channel
+    let pwen = 1 << 0; // enable pwm
+    let msen = 1 << 7; // use M/S transition instead of pwm algorithm
+
+    // reset settings
+    pwm_mem[pwm_ctl_reg] =
+        (pwm_mem[pwm_ctl_reg] & !(ctl_mask << shift)) | (msen << shift) | (pwen << shift);
+
+    // set duty cycle
+    pwm_mem[pwm_dat_reg] = duty_len;
+    pwm_mem[pwm_rng_reg] = cycle_len;
+
+    sleep(Duration::from_micros(10));
 }
 
 // Enables given IRQs (by setting bit to 1 at intended position).
 // See 'ARM peripherals interrupts table' in pheripherals datasheet.
 // WARNING: you can corrupt your system, only use this if you know what you are doing.
-fn enable_irqs(intr: &mut [u32], irqs: &IRQs) {
+fn enable_irqs(intr_mem: &mut [u32], irqs: &IRQs) {
     let irq_enable_0 = 0x214usize / 4;
     let irq_enable_1 = 0x210usize / 4;
 
-    intr[irq_enable_0] = irqs.0; // IRQ 32..63
-    intr[irq_enable_1] = irqs.1; // IRQ 0..31
+    intr_mem[irq_enable_0] = irqs.0; // IRQ 32..63
+    intr_mem[irq_enable_1] = irqs.1; // IRQ 0..31
 }
 
 // Disables given IRQs (by setting bit to 1 at intended position).
 // See 'ARM peripherals interrupts table' in pheripherals datasheet.
 // WARNING: you can corrupt your system, only use this if you know what you are doing.
-fn disable_irqs(intr: &mut [u32], irqs: &IRQs) {
+fn disable_irqs(intr_mem: &mut [u32], irqs: &IRQs) {
     let irq_disable_0 = 0x220usize / 4;
     let irq_disable_1 = 0x21Cusize / 4;
 
-    intr[irq_disable_0] = irqs.0; // IRQ 32..63
-    intr[irq_disable_1] = irqs.1; // IRQ 0..31
+    intr_mem[irq_disable_0] = irqs.0; // IRQ 32..63
+    intr_mem[irq_disable_1] = irqs.1; // IRQ 0..31
 }
 
-fn read_irqs(intr: &[u32]) -> IRQs {
+fn read_irqs(intr_mem: &[u32]) -> IRQs {
     let irq_enable_0 = 0x214usize / 4;
     let irq_enable_1 = 0x210usize / 4;
 
-    IRQs(intr[irq_enable_0], intr[irq_enable_1])
+    IRQs(intr_mem[irq_enable_0], intr_mem[irq_enable_1])
+}
+
+fn read_pin(gpio_mem: &[u32], pin: Pin) -> PinState {
+    let level_reg = pin as usize / 32 + 13;
+
+    if (gpio_mem[level_reg] & (1 << (pin & 31))) != 0 {
+        return PinState::High;
+    }
+
+    PinState::Low
+}
+
+// Sets the mode of a given pin (Input, Output, Clock, Pwm or Spi)
+//
+// Clock is possible only for pins 4, 5, 6, 20, 21.
+// Pwm is possible only for pins 12, 13, 18, 19.
+//
+// Spi mode should not be set by this directly, use SpiBegin instead.
+fn set_pin_mode(gpio_mem: &mut [u32], pin: Pin, mode: PinMode) {
+    let fsel_reg = pin as usize / 10;
+    let shift = pin % 10 * 3;
+
+    let _in = 0b0;
+    let _out = 0b1;
+    let _alt0 = 0b100;
+    let _alt1 = 0b101;
+    let _alt2 = 0b110;
+    let _alt3 = 0b111;
+    let _alt4 = 0b011;
+    let _alt5 = 0b010;
+
+    let f = match mode {
+        PinMode::Input => _in,
+        PinMode::Ouput => _out,
+        PinMode::Clock => match pin {
+            4 | 5 | 6 | 32 | 34 | 42 | 43 | 44 => _alt0,
+            20 | 21 => _alt5,
+            _ => return,
+        },
+        PinMode::Pwm => match pin {
+            12 | 13 | 40 | 41 | 45 => _alt0,
+            18 | 19 => _alt5,
+            _ => return,
+        },
+        PinMode::Spi => match pin {
+            7 | 8 | 9 | 10 | 11 => _alt0,    // SPI0,
+            35 | 36 | 37 | 38 | 39 => _alt0, // SPI0
+            16 | 17 | 18 | 19 | 20 | 21 => _alt4,
+            40 | 41 | 42 | 43 | 44 | 45 => _alt4,
+            _ => return,
+        },
+        PinMode::Alt0 => _alt0,
+        PinMode::Alt1 => _alt1,
+        PinMode::Alt2 => _alt2,
+        PinMode::Alt3 => _alt3,
+        PinMode::Alt4 => _alt4,
+        PinMode::Alt5 => _alt5,
+    };
+
+    let pin_mask = 7; // 111 - pinmode is 3 bits
+
+    gpio_mem[fsel_reg] = (gpio_mem[fsel_reg] & !(pin_mask << shift)) | (f << shift);
+}
+
+fn write_pin(gpio_mem: &mut [u32], pin: Pin, state: PinState) {
+    // Set register, 7 / 8 depending on bank
+    // Clear register, 10 / 11 depending on bank
+    let set_reg = pin as usize / 32 + 7;
+    let clear_reg = pin as usize / 32 + 10;
+
+    match state {
+        PinState::Low => {
+            gpio_mem[clear_reg] = 1 << (pin & 31);
+        }
+        PinState::High => {
+            gpio_mem[set_reg] = 1 << (pin & 31);
+        }
+    }
+}
+
+fn toggle_pin(gpio_mem: &mut [u32], pin: Pin) {
+    let pin_usize = pin as usize;
+
+    let set_reg = pin_usize / 32 + 7;
+    let clear_reg = pin_usize / 32 + 10;
+    let level_reg = pin_usize / 32 + 13;
+
+    let bit: u32 = 1 << (pin & 31);
+
+    if (gpio_mem[level_reg] & bit) != 0 {
+        gpio_mem[clear_reg] = bit;
+    } else {
+        gpio_mem[set_reg] = bit;
+    }
 }
 
 #[inline]
@@ -614,6 +613,33 @@ fn read_endian_u32(buf: &[u8], endianess: Endianness) -> Option<u32> {
                 Endianness::LittleEndian => Some((b3 << 24) | (b2 << 16) | (b1 << 8) | b0),
             }
         }
+    }
+}
+
+// Read /proc/device-tree/soc/ranges and determine the base address.
+// Use the default Raspberry Pi 1 base address if this fails.
+fn read_base_addr(offset: usize) -> Result<usize> {
+    let mut ranges = File::open("/proc/device-tree/soc/ranges")?;
+
+    ranges.seek(SeekFrom::Start(offset as u64))?;
+    let mut buf = vec![0u8; 4];
+    let read = ranges.read(&mut buf[..])?;
+    if read != buf.len() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "EOF"));
+    }
+
+    match read_bigendian_u32(&buf) {
+        Some(out) => match out {
+            0 => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid bigendian uint32",
+            )),
+            x => Ok(x as usize),
+        },
+        None => Err(Error::new(
+            ErrorKind::InvalidData,
+            "Cannot read as bigendian uint32",
+        )),
     }
 }
 
