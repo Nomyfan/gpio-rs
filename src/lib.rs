@@ -59,6 +59,7 @@ enum Pull {
 }
 
 // Edge events
+#[derive(PartialEq)]
 enum Edge {
     NoEdge = 0b00000000,
     RiseEdge = 0b00000001,
@@ -357,6 +358,17 @@ impl Gpio {
         read_pull(self.gpio.as_u32_slice(), pin)
     }
 
+    pub fn detect_edge(&mut self, pin: Pin, edge: Edge) {
+        let gpio_mem = self.gpio.as_u32_mut_slice();
+        let intr_mem = self.intr.as_u32_mut_slice();
+        detect_edge(gpio_mem, intr_mem, pin, edge);
+    }
+
+    pub fn is_edge_detected(&mut self, pin: Pin) -> bool {
+        let gpio_mem = self.gpio.as_u32_mut_slice();
+        is_edge_detected(gpio_mem, pin)
+    }
+
     pub fn is_bcm2711(&self) -> bool {
         is_bcm2711(self.gpio.as_u32_slice())
     }
@@ -474,6 +486,67 @@ fn read_pull(gpio_mem: &[u32], pin: Pin) -> Option<Pull> {
         2 => Some(Pull::PullDown),
         _ => None,
     }
+}
+
+// Enable edge event detection on pin.
+//
+// Combine with is_edge_detected() to check whether event occured.
+//
+// Note that using this function might conflict with the same functionality of other gpio library.
+//
+// It also clears previously detected event of this pin if there was any.
+//
+// Note that call with RiseEdge will disable previously set FallEdge detection and vice versa.
+// You have to call with AnyEdge, to enable detection for both edges.
+// To disable previously enabled detection call it with NoEdge.
+//
+// WARNING: this might make your Pi unresponsive, if this happens, you should either run the code as root,
+// or add `dtoverlay=gpio-no-irq` to `/boot/config.txt` and restart your pi
+fn detect_edge(gpio_mem: &mut [u32], intr_mem: &mut [u32], pin: Pin, edge: Edge) {
+    if edge != Edge::NoEdge {
+        // disable GPIO event interruption to prevent freezing in some cases
+        disable_irqs(intr_mem, &IRQs(1 << 20, 1 << 17));
+    }
+
+    // Rising edge detect enable register (19/20 depending on bank)
+    // Falling edge detect enable register (22/23 depending on bank)
+    // Event detect status register (16/17)
+    let ren_reg = pin as usize / 32 + 19;
+    let fen_reg = pin as usize / 32 + 22;
+    let eds_reg = pin as usize / 32 + 16;
+
+    let bit = (1 << (pin & 31)) as u32;
+    let edge_bits = edge as u32;
+
+    if (edge_bits & Edge::RiseEdge as u32) > 0 {
+        gpio_mem[ren_reg] |= bit;
+    } else {
+        gpio_mem[ren_reg] &= !bit;
+    }
+
+    if (edge_bits & Edge::FallEdge as u32) > 0 {
+        gpio_mem[fen_reg] |= bit;
+    } else {
+        gpio_mem[fen_reg] &= !bit;
+    }
+
+    gpio_mem[eds_reg] = bit; // to clear outdated detection
+}
+
+// Checks whether edge event occured since last call
+// or since detection was enabled
+//
+// There is no way (yet) to handle interruption caused by edge event, you have to use polling.
+//
+// Event detection has to be enabled first, by pin.Detect(edge)
+fn is_edge_detected(gpio_mem: &mut [u32], pin: Pin) -> bool {
+    // Event detect status register (16/17)
+    let eds_reg = pin as usize / 32 + 16;
+
+    let test = gpio_mem[eds_reg] & (1 << (pin & 31));
+    gpio_mem[eds_reg] = test; // set bit to clear it
+
+    test != 0
 }
 
 // Starts pwm for both channels
