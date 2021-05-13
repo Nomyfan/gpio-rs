@@ -119,8 +119,8 @@ impl Gpio {
         let clk = map_mem(&file, clk_addr, PAGE_SIZE)?;
         let pwm = map_mem(&file, pwm_addr, PAGE_SIZE)?;
         let spi = map_mem(&file, spi_addr, PAGE_SIZE)?;
-        let mut intr = map_mem(&file, intr_addr, PAGE_SIZE)?;
-        let irqs_backup = read_irqs(intr.as_u32_mut_slice()); // back up enabled IRQs, to restore it later
+        let intr = map_mem(&file, intr_addr, PAGE_SIZE)?;
+        let irqs_backup = read_irqs(intr.as_u32_slice()); // back up enabled IRQs, to restore it later
 
         Ok(Gpio {
             gpio,
@@ -585,7 +585,7 @@ fn disable_irqs(intr: &mut [u32], irqs: &IRQs) {
     intr[irq_disable_1] = irqs.1; // IRQ 0..31
 }
 
-fn read_irqs(intr: &mut [u32]) -> IRQs {
+fn read_irqs(intr: &[u32]) -> IRQs {
     let irq_enable_0 = 0x214usize / 4;
     let irq_enable_1 = 0x210usize / 4;
 
