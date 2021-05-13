@@ -322,7 +322,7 @@ impl Gpio {
     // The channels are:
     //   channel 1 (pwm0) for pins 12, 18, 40
     //   channel 2 (pwm1) for pins 13, 19, 41, 45.
-    pub fn set_duty_cycle(&mut self, pin: &Pin, duty_len: u32, cycle_len: u32) {
+    pub fn set_duty_cycle(&mut self, pin: Pin, duty_len: u32, cycle_len: u32) {
         let pwm_ctl_reg = 0usize;
 
         // shift: offset inside ctlReg
