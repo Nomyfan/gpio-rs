@@ -53,10 +53,9 @@ enum PinState {
 
 // Pull Up / Down / Off
 enum Pull {
-    PullOff,
-    PullDown,
-    PullUp,
-    PullNone,
+    PullOff = 0,
+    PullDown = 1,
+    PullUp = 2,
 }
 
 // Edge events
@@ -348,10 +347,18 @@ impl Gpio {
         sleep(Duration::from_micros(10));
     }
 
-    // The Pi 4 uses a BCM 2711, which has different register offsets and base addresses than the rest of the Pi family (so far).  This
-    // helper function checks if we're on a 2711 and hence a Pi 4
-    fn is_bcm2711(&self) -> bool {
-        self.gpio.as_u32_slice()[GPPUPPDN3] != 0x6770696f
+    pub fn set_pull_mode(&mut self, pin: Pin, pull: Pull) {
+        let is_bcm2711 = self.is_bcm2711();
+        let gpio_mem = self.gpio.as_u32_mut_slice();
+        set_pull_mode(gpio_mem, pin, pull, is_bcm2711);
+    }
+
+    pub fn read_pull(&self, pin: Pin) -> Option<Pull> {
+        read_pull(self.gpio.as_u32_slice(), pin)
+    }
+
+    pub fn is_bcm2711(&self) -> bool {
+        is_bcm2711(self.gpio.as_u32_slice())
     }
 }
 
@@ -403,6 +410,69 @@ fn read_base_addr(offset: usize) -> Result<usize> {
             ErrorKind::InvalidData,
             "Cannot read as bigendian uint32",
         )),
+    }
+}
+
+fn set_pull_mode(gpio_mem: &mut [u32], pin: Pin, pull: Pull, is_bcm2711: bool) {
+    if is_bcm2711 {
+        set_pull_mode_for_bcm2711(gpio_mem, pin, pull);
+    } else {
+        // Pull up/down/off register has offset 38 / 39, pull is 37
+        let pull_clk_reg = pin as usize / 32 + 38;
+        let pull_reg = 37;
+        let shift = pin % 32;
+
+        match pull {
+            Pull::PullDown | Pull::PullUp => {
+                gpio_mem[pull_reg] |= pull as u32;
+            }
+            Pull::PullOff => {
+                gpio_mem[pull_reg] &= !3;
+            }
+        }
+
+        // Wait for value to clock in, this is ugly, sorry :(
+        sleep(Duration::from_micros(1));
+
+        gpio_mem[pull_clk_reg] = 1 << shift;
+
+        // Wait for value to clock in
+        sleep(Duration::from_micros(1));
+
+        gpio_mem[pull_reg] &= !3;
+        gpio_mem[pull_clk_reg] = 0;
+    }
+}
+
+fn set_pull_mode_for_bcm2711(gpio_mem: &mut [u32], pin: Pin, pull: Pull) {
+    let pull_reg = GPPUPPDN0 + (pin >> 4) as usize;
+    let shift = (pin & 0xf) << 1;
+
+    let p = match pull {
+        Pull::PullOff => 0,
+        Pull::PullUp => 1,
+        Pull::PullDown => 2,
+    };
+
+    // This is verbatim C code from raspi-gpio.c
+    let pull_bits = gpio_mem[pull_reg];
+    let pull_bits = pull_bits & !(3 << shift);
+    let pull_bits = pull_bits | (p << shift);
+    gpio_mem[pull_reg] = pull_bits;
+}
+
+fn read_pull(gpio_mem: &[u32], pin: Pin) -> Option<Pull> {
+    if !is_bcm2711(gpio_mem) {
+        return None;
+    }
+
+    let reg = GPPUPPDN0 + (pin >> 4) as usize;
+    let bits = gpio_mem[reg] >> (((pin & 0xf) << 1) & 0x3);
+    match bits {
+        0 => Some(Pull::PullOff),
+        1 => Some(Pull::PullUp),
+        2 => Some(Pull::PullDown),
+        _ => None,
     }
 }
 
@@ -482,6 +552,12 @@ fn get_base_addr() -> usize {
             Err(..) => BCM_2835_BASE,
         },
     }
+}
+
+// The Pi 4 uses a BCM 2711, which has different register offsets and base addresses than the rest of the Pi family (so far).  This
+// helper function checks if we're on a 2711 and hence a Pi 4
+fn is_bcm2711(gpio_mem: &[u32]) -> bool {
+    gpio_mem[GPPUPPDN3] != 0x6770696f
 }
 
 #[cfg(test)]
